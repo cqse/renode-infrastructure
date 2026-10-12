@@ -671,6 +671,7 @@ namespace Antmicro.Renode.UserInterface
             BindStatic("plugins", () => TypeManager.Instance.PluginManager);
             BindStatic("EmulationManager", () => EmulationManager.Instance);
             BindStatic("sockets", () => SocketsManager.Instance);
+            BindStatic("TestwiseCoverage", () => Antmicro.Renode.Peripherals.CPU.TestwiseCoverage.Instance);
         }
 
         [PreSerialization]
