@@ -1003,7 +1003,26 @@ namespace Antmicro.Renode.Peripherals.CPU
                     throw new RecoverableException("Log file not set. Nothing will be logged.");
                 }
                 logTranslatedBlocks = value;
-                TlibSetOnBlockTranslationEnabled(value ? 1 : 0);
+                UpdateBlockTranslationCallbackEnabled();
+            }
+        }
+
+        /// <summary>
+        /// Raised for every newly translated block with its first (virtual) PC and its size in bytes.
+        /// A block is translated right before its first execution, so after <see cref="ClearTranslationCache"/>
+        /// the translated blocks approximate the executed ones (used by testwise coverage).
+        /// </summary>
+        public event Action<ulong, uint> BlockTranslated
+        {
+            add
+            {
+                blockTranslated += value;
+                UpdateBlockTranslationCallbackEnabled();
+            }
+            remove
+            {
+                blockTranslated -= value;
+                UpdateBlockTranslationCallbackEnabled();
             }
         }
 
@@ -1515,6 +1534,16 @@ namespace Antmicro.Renode.Peripherals.CPU
             return memoryManager.Reallocate(oldPointer, newSize);
         }
 
+        private void UpdateBlockTranslationCallbackEnabled()
+        {
+            // Subscribers may unsubscribe after the CPU (and its tlib instance) is gone, e.g. on machine removal.
+            if(disposed)
+            {
+                return;
+            }
+            TlibSetOnBlockTranslationEnabled((logTranslatedBlocks || blockTranslated != null) ? 1 : 0);
+        }
+
         private void UpdateBlockBeginHookPresent()
         {
             TlibSetBlockBeginHookPresent((blockBeginInternalHook != null || blockBeginUserHook != null || IsSingleStepMode || hooks.IsAnyInactive) ? 1u : 0u);
@@ -1531,6 +1560,11 @@ namespace Antmicro.Renode.Peripherals.CPU
         [Export]
         private void LogDisassembly(ulong pc, uint size, uint flags)
         {
+            // size == 0: magic PC values in Cortex-M (e.g. EXC_RETURN), not code
+            if(size > 0)
+            {
+                blockTranslated?.Invoke(pc, size);
+            }
             if(LogFile == null)
             {
                 return;
@@ -2119,6 +2153,8 @@ namespace Antmicro.Renode.Peripherals.CPU
         private NativeBinder binder;
 
         private bool logTranslatedBlocks;
+        [Transient]
+        private Action<ulong, uint> blockTranslated;
         private bool isInterruptLoggingEnabled;
         private LogFunctionNamesState? logFunctionNamesCurrentState;
         private Action<ulong, uint> blockFinishedHook;

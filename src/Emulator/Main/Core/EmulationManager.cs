@@ -210,6 +210,15 @@ namespace Antmicro.Renode.Core
             }
         }
 
+        /// <summary>
+        /// Records the executed code per test for all current and future CPUs (see <see cref="Peripherals.CPU.TestwiseCoverage"/>).
+        /// Test boundaries: <c>TestwiseCoverage BeginTest "suite" "test"</c> / <c>TestwiseCoverage EndTest "result"</c>.
+        /// </summary>
+        public void EnableTestwiseCoverageGlobally(string outputDirectory)
+        {
+            Peripherals.CPU.TestwiseCoverage.Instance.Enable(outputDirectory);
+        }
+
         // Note that 'SequencedFilePath' is not used directly in this method as it wwould corrupt the 'SnapshotTracker' state.
         // Instead 'SnapshotTracker' uses 'SequencedFilePath' internally during 'MakeSpaceAtPath' call.
         public void Save(string path)
