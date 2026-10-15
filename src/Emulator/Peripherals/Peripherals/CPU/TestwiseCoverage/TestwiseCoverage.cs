@@ -11,10 +11,12 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
+using Antmicro.Renode.Peripherals.UART;
 
 namespace Antmicro.Renode.Peripherals.CPU
 {
@@ -51,24 +53,59 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public void BeginTest(string suite, string test)
         {
+            BeginTestInner(suite, test, fromEmulation: false);
+        }
+
+        public void EndTest(string result)
+        {
+            EndTestOuter(result, fromEmulation: false);
+        }
+
+        /// <summary>
+        /// Take test boundaries from ztest's console output instead of from BeginTest/EndTest calls, for runners that
+        /// start one emulation per test binary and don't know its test cases (e.g. twister). On the given UART,
+        /// "Running TESTSUITE s" sets the suite, "START - c" begins test "&lt;scenario&gt;/s"/"c" and
+        /// "PASS|FAIL|SKIP - c" ends it. Code executed between test cases (boot, suite setup and teardown) is reported as
+        /// a "__setup__" pseudo-test of the following suite. The UART may be created later (e.g. by a platform script).
+        /// </summary>
+        public void SplitByZtest(string uartName, string scenario)
+        {
+            lock(sync)
+            {
+                CheckEnabled();
+                ztestUart = uartName.Substring(uartName.LastIndexOf('.') + 1);
+                ztestScenario = scenario;
+                recordBetweenTests = true;
+                foreach(var machine in EmulationManager.Instance.CurrentEmulation.Machines)
+                {
+                    foreach(var uart in machine.GetPeripheralsOfType<IUART>())
+                    {
+                        AttachToUart(machine, uart);
+                    }
+                }
+            }
+        }
+
+        private void BeginTestInner(string suite, string test, bool fromEmulation)
+        {
             lock(sync)
             {
                 CheckEnabled();
                 if(currentTest != null)
                 {
                     Logger.Log(LogLevel.Warning, "Testwise coverage: test '{0}' was not ended, closing it as UNKNOWN", currentTest);
-                    EndTestInner("UNKNOWN");
+                    EndTestInner("UNKNOWN", fromEmulation);
                 }
                 else if(cpus.Values.Any(x => x.Current?.Count > 0) || detachedRecords.Any(x => x.Count > 0))
                 {
-                    // Code executed outside of any test on CPUs created after the last test (e.g. suite setup)
+                    // Code executed outside of any test (e.g. suite setup, or CPUs created after the last test)
                     // is reported as a pseudo-test of the next test's suite.
                     currentSuite = suite;
                     currentTest = SetupTestName;
-                    EndTestInner("PASS");
+                    EndTestInner("PASS", fromEmulation);
                 }
 
-                StartRecording();
+                StartRecording(fromEmulation);
                 currentSuite = suite;
                 currentTest = test;
                 attempt = attempts.TryGetValue((suite, test), out var n) ? n + 1 : 1;
@@ -78,7 +115,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
         }
 
-        public void EndTest(string result)
+        private void EndTestOuter(string result, bool fromEmulation)
         {
             lock(sync)
             {
@@ -89,7 +126,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                     Logger.Log(LogLevel.Warning, "Testwise coverage: EndTest called without BeginTest, ignoring");
                     return;
                 }
-                EndTestInner(result);
+                EndTestInner(result, fromEmulation);
             }
         }
 
@@ -187,6 +224,14 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         private void OnPeripheralsChanged(IMachine machine, PeripheralsChangedEventArgs args)
         {
+            if(args.Peripheral is IUART uart && args.Operation == PeripheralsChangedEventArgs.PeripheralChangeType.Addition)
+            {
+                lock(sync)
+                {
+                    AttachToUart(machine, uart);
+                }
+                return;
+            }
             if(!(args.Peripheral is TranslationCPU cpu))
             {
                 return;
@@ -235,10 +280,69 @@ namespace Antmicro.Renode.Peripherals.CPU
             cpus.Remove(cpu);
         }
 
-        private void StartRecording()
+        private void AttachToUart(IMachine machine, IUART uart)
+        {
+            if(ztestUart == null || ztestUarts.Contains(uart))
+            {
+                return;
+            }
+            ztestUarts.Add(uart);
+            var line = new StringBuilder();
+            string suite = null;
+            bool? isZtestUart = null;
+            uart.CharReceived += c =>
+            {
+                // Called on the CPU thread while the guest writes to the UART. The name isn't registered yet when the
+                // UART is added, so check it on the first character.
+                if(isZtestUart == null)
+                {
+                    isZtestUart = machine.TryGetLocalName(uart, out var name) && name == ztestUart;
+                }
+                if(isZtestUart == false)
+                {
+                    return;
+                }
+                if(c != '\n')
+                {
+                    if(c != '\r')
+                    {
+                        line.Append((char)c);
+                    }
+                    return;
+                }
+                var text = AnsiEscape.Replace(line.ToString(), "").Trim();
+                line.Clear();
+                Match m;
+                if((m = ZtestSuite.Match(text)).Success)
+                {
+                    suite = m.Groups[1].Value;
+                }
+                else if((m = ZtestStart.Match(text)).Success)
+                {
+                    BeginTestInner($"{ztestScenario}/{suite ?? "unknown"}", m.Groups[1].Value, fromEmulation: true);
+                }
+                else if((m = ZtestEnd.Match(text)).Success && currentTest == m.Groups[2].Value)
+                {
+                    EndTestOuter(m.Groups[1].Value, fromEmulation: true);
+                }
+            };
+        }
+
+        private void StartRecording(bool fromEmulation)
         {
             detachedRecords.Clear();
             detachedImages.Clear();
+            if(fromEmulation)
+            {
+                // On the CPU thread (a boundary seen in the guest's output): pausing the machine here would deadlock.
+                // The CPU returns after the current block and clears its cache before executing anything else.
+                foreach(var state in cpus.Values)
+                {
+                    state.Current = new CpuRecord(state.Machine, state.Cpu);
+                    state.Cpu.RequestTranslationCacheClearing();
+                }
+                return;
+            }
             foreach(var machineCpus in cpus.Values.GroupBy(x => x.Machine))
             {
                 using(machineCpus.Key.ObtainPausedState(true))
@@ -252,7 +356,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
         }
 
-        private void EndTestInner(string result)
+        private void EndTestInner(string result, bool fromEmulation = false)
         {
             var records = cpus.Values.Select(x => x.Current).Where(x => x != null).Concat(detachedRecords).ToList();
             var images = EmulationManager.Instance.CurrentEmulation.Machines.SelectMany(GetImages).Concat(detachedImages).ToList();
@@ -287,14 +391,20 @@ namespace Antmicro.Renode.Peripherals.CPU
 
             currentSuite = null;
             currentTest = null;
+            detachedRecords.Clear();
+            detachedImages.Clear();
+            if(recordBetweenTests)
+            {
+                // ztest: code between test cases is suite setup/teardown, reported as __setup__ of the next suite.
+                StartRecording(fromEmulation);
+                return;
+            }
             // The test's machines may keep running until they are removed (e.g. Reset Emulation in the teardown).
             // That tail belongs to no test, so stop recording on them; CPUs created from now on are recorded as setup.
             foreach(var state in cpus.Values)
             {
                 state.Current = null;
             }
-            detachedRecords.Clear();
-            detachedImages.Clear();
         }
 
         private static IEnumerable<ImageInfo> GetImages(IMachine machine)
@@ -340,7 +450,17 @@ namespace Antmicro.Renode.Peripherals.CPU
             return builder.Append('"').ToString();
         }
 
+        private static readonly Regex AnsiEscape = new Regex(@"\x1b\[[0-9;]*[A-Za-z]");
+        private static readonly Regex ZtestSuite = new Regex(@"^Running TESTSUITE (\S+)");
+        private static readonly Regex ZtestStart = new Regex(@"^START - (\S+)");
+        private static readonly Regex ZtestEnd = new Regex(@"^(PASS|FAIL|SKIP) - (\S+)");
+
         private readonly object sync = new object();
+        // ztest mode (SplitByZtest): boundaries come from the guest's console output.
+        private readonly HashSet<IUART> ztestUarts = new HashSet<IUART>();
+        private string ztestUart;
+        private string ztestScenario;
+        private bool recordBetweenTests;
         private readonly Dictionary<TranslationCPU, CpuState> cpus = new Dictionary<TranslationCPU, CpuState>();
         // Records and images of CPUs/machines removed during the current test.
         private readonly List<CpuRecord> detachedRecords = new List<CpuRecord>();
